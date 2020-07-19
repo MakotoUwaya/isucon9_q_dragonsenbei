@@ -1,0 +1,48 @@
+name: "build/deploy isucari"
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.14.6-buster
+    steps:
+      - uses: actions/checkout@v1
+      - name: build binary
+        run: |
+          cd ./webapp/go
+          make
+      - name: upload binary as artifact
+        uses: actions/upload-artifact@v1
+        with:
+          name: executable
+          path: webapp/go/isucari
+      - name: notify build failure
+        if: failure()
+        run: |
+          echo "$GITHUB_REF のビルドは失敗しました。"
+  deploy:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: install credential
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          mkdir -p "$HOME/.ssh"
+          echo "$SSH_KEY" > "$HOME/.ssh/id_rsa"
+          chmod 400 "$HOME/.ssh/id_rsa"
+      - name: download binary
+        uses: actions/download-artifact@v1
+        with:
+          name: executable
+          path: executable
+      - name: deploy binary
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          ssh -o StrictHostKeyChecking=no "root@$SSH_HOST" "systemctl stop isucari"
+          scp -o StrictHostKeyChecking=no executable/isucari "root@$SSH_HOST:/home/isucon/go/src/github.com/isucon/isucon9-qualify/webapp/go/isucari"
+          ssh -o StrictHostKeyChecking=no "root@$SSH_HOST" "chown isucon:isucon /home/isucon/go/src/github.com/isucon/isucon9-qualify/webapp/go/isucari"
+          ssh -o StrictHostKeyChecking=no "root@$SSH_HOST" "systemctl start isucari"
+          echo "$GITHUB_REF のデプロイが成功しました。"
