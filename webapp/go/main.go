@@ -21,6 +21,8 @@ import (
 	goji "goji.io"
 	"goji.io/pat"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/newrelic/go-agent/v3/newrelic"
 )
 
 const (
@@ -63,6 +65,7 @@ var (
 	templates *template.Template
 	dbx       *sqlx.DB
 	store     sessions.Store
+	app       *newrelic.Application
 )
 
 type Config struct {
@@ -268,6 +271,20 @@ type resSetting struct {
 	Categories        []Category `json:"categories"`
 }
 
+func nrt(inner http.Handler) http.Handler {
+	mw := func(w http.ResponseWriter, r *http.Request) {
+		txn := app.StartTransaction(r.URL.Path)
+		defer txn.End()
+
+		r = newrelic.RequestWithTransactionContext(r, txn)
+
+		txn.SetWebRequestHTTP(r)
+		w = txn.SetWebResponse(w)
+		inner.ServeHTTP(w, r)
+	}
+	return http.HandlerFunc(mw)
+}
+
 func init() {
 	store = sessions.NewCookieStore([]byte("abc"))
 
@@ -279,6 +296,17 @@ func init() {
 }
 
 func main() {
+	var err error
+	app, err = newrelic.NewApplication(
+		newrelic.ConfigAppName("ISUCON9-q-uwaya"),
+		newrelic.ConfigLicense(os.Getenv("NEW_RELIC_LICENSE_KEY")),
+		newrelic.ConfigDebugLogger(os.Stdout),
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
 	host := os.Getenv("MYSQL_HOST")
 	if host == "" {
 		host = "127.0.0.1"
@@ -287,7 +315,7 @@ func main() {
 	if port == "" {
 		port = "3306"
 	}
-	_, err := strconv.Atoi(port)
+	_, err = strconv.Atoi(port)
 	if err != nil {
 		log.Fatalf("failed to read DB port number from an environment variable MYSQL_PORT.\nError: %s", err.Error())
 	}
@@ -320,6 +348,7 @@ func main() {
 	defer dbx.Close()
 
 	mux := goji.NewMux()
+	mux.Use(nrt)
 
 	// API
 	mux.HandleFunc(pat.Post("/initialize"), postInitialize)
