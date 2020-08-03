@@ -1031,7 +1031,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 				tx.Rollback()
 				return
 			}
-			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
+			ssr, err := APIShipmentStatus(ctx, getShipmentServiceURL(), &APIShipmentStatusReq{
 				ReserveID: shipping.ReserveID,
 			})
 			if err != nil {
@@ -1437,7 +1437,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scr, err := APIShipmentCreate(getShipmentServiceURL(), &APIShipmentCreateReq{
+	scr, err := APIShipmentCreate(ctx, getShipmentServiceURL(), &APIShipmentCreateReq{
 		ToAddress:   buyer.Address,
 		ToName:      buyer.AccountName,
 		FromAddress: seller.Address,
@@ -1451,7 +1451,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pstr, err := APIPaymentToken(getPaymentServiceURL(), &APIPaymentServiceTokenReq{
+	pstr, err := APIPaymentToken(ctx, getPaymentServiceURL(), &APIPaymentServiceTokenReq{
 		ShopID: PaymentServiceIsucariShopID,
 		Token:  rb.Token,
 		APIKey: PaymentServiceIsucariAPIKey,
@@ -1608,7 +1608,7 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	img, err := APIShipmentRequest(getShipmentServiceURL(), &APIShipmentRequestReq{
+	img, err := APIShipmentRequest(ctx, getShipmentServiceURL(), &APIShipmentRequestReq{
 		ReserveID: shipping.ReserveID,
 	})
 	if err != nil {
@@ -1740,7 +1740,7 @@ func postShipDone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
+	ssr, err := APIShipmentStatus(ctx, getShipmentServiceURL(), &APIShipmentStatusReq{
 		ReserveID: shipping.ReserveID,
 	})
 	if err != nil {
@@ -1881,7 +1881,7 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
+	ssr, err := APIShipmentStatus(ctx, getShipmentServiceURL(), &APIShipmentStatusReq{
 		ReserveID: shipping.ReserveID,
 	})
 	if err != nil {
