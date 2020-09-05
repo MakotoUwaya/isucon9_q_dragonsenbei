@@ -9,13 +9,18 @@ import (
 	"html/template"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"syscall"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
 	goji "goji.io"
@@ -59,7 +64,7 @@ const (
 	ItemsPerPage        = 48
 	TransactionsPerPage = 10
 
-	BcryptCost = 10
+	BcryptCost = 4
 )
 
 var (
@@ -73,6 +78,13 @@ type Config struct {
 	Name string `json:"name" db:"name"`
 	Val  string `json:"val" db:"val"`
 }
+
+var (
+	config = map[string]string{
+		"payment_service_url":  DefaultPaymentServiceURL,
+		"shipment_service_url": DefaultShipmentServiceURL,
+	}
+)
 
 type User struct {
 	ID             int64     `json:"id" db:"id"`
@@ -198,8 +210,8 @@ type resUserItems struct {
 }
 
 type resTransactions struct {
-	HasNext bool         `json:"has_next"`
-	Items   []ItemDetail `json:"items"`
+	HasNext bool          `json:"has_next"`
+	Items   []*ItemDetail `json:"items"`
 }
 
 type reqRegister struct {
@@ -308,6 +320,7 @@ func main() {
 		panic(err)
 	}
 
+	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 1000
 	host := os.Getenv("MYSQL_HOST")
 	if host == "" {
 		host = "127.0.0.1"
@@ -387,6 +400,36 @@ func main() {
 	// Assets
 	mux.Handle(pat.Get("/*"), http.FileServer(http.Dir("../public")))
 	log.Fatal(http.ListenAndServe(":8000", mux))
+	if os.Getenv("UNIX") != "" {
+		listener, err := net.Listen("unix", "/var/run/gopher/go.sock")
+		if err != nil {
+			log.Fatalf("error: %v", err)
+		}
+		defer func() {
+			if err := listener.Close(); err != nil {
+				log.Printf("error: %v", err)
+			}
+		}()
+
+		shutdown(listener)
+		if err := http.Serve(listener, mux); err != nil {
+			log.Fatalf("error: %v", err)
+		}
+	} else {
+		log.Fatal(http.ListenAndServe(":8000", mux))
+	}
+}
+
+func shutdown(listener net.Listener) {
+	c := make(chan os.Signal, 2)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		if err := listener.Close(); err != nil {
+			log.Printf("error: %v", err)
+		}
+		os.Exit(1)
+	}()
 }
 
 func getSession(r *http.Request) *sessions.Session {
@@ -406,12 +449,24 @@ func getCSRFToken(r *http.Request) string {
 	return csrfToken.(string)
 }
 
+var (
+	userMap    = make(map[int64]*User)
+	userMapMux = sync.RWMutex{}
+)
+
 func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 	session := getSession(r)
 	userID, ok := session.Values["user_id"]
 	if !ok {
 		return user, http.StatusNotFound, "no session"
 	}
+
+	userMapMux.RLock()
+	if val, ok := userMap[userID.(int64)]; ok {
+		userMapMux.RUnlock()
+		return *val, http.StatusOK, ""
+	}
+	userMapMux.RUnlock()
 
 	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
 	err := dbx.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
@@ -422,6 +477,9 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 		log.Print(err)
 		return user, http.StatusInternalServerError, "db error"
 	}
+	userMapMux.Lock()
+	defer userMapMux.Unlock()
+	userMap[userID.(int64)] = &user
 
 	return user, http.StatusOK, ""
 }
@@ -432,10 +490,23 @@ type SQLDB interface {
 
 func getUserSimpleByID(ctx context.Context, q SQLDB, userID int64) (userSimple UserSimple, err error) {
 	user := User{}
+	userMapMux.RLock()
+	if val, ok := userMap[userID]; ok {
+		userSimple.ID = val.ID
+		userSimple.AccountName = val.AccountName
+		userSimple.NumSellItems = val.NumSellItems
+		userMapMux.RUnlock()
+		return userSimple, err
+	}
+	userMapMux.RUnlock()
+
 	err = q.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err != nil {
 		return userSimple, err
 	}
+	userMapMux.Lock()
+	defer userMapMux.Unlock()
+	userMap[user.ID] = &user
 	userSimple.ID = user.ID
 	userSimple.AccountName = user.AccountName
 	userSimple.NumSellItems = user.NumSellItems
@@ -443,28 +514,19 @@ func getUserSimpleByID(ctx context.Context, q SQLDB, userID int64) (userSimple U
 }
 
 func getCategoryByID(ctx context.Context, q SQLDB, categoryID int) (category Category, err error) {
-	err = q.GetContext(ctx, &category, "SELECT * FROM `categories` WHERE `id` = ?", categoryID)
-	if category.ParentID != 0 {
-		parentCategory, err := getCategoryByID(ctx, q, category.ParentID)
+	cat, ok := categoryList[categoryID]
+	if !ok {
+		err = q.GetContext(ctx, &category, "SELECT * FROM `categories` WHERE `id` = ?", categoryID)
 		if err != nil {
 			return category, err
 		}
-		category.ParentCategoryName = parentCategory.CategoryName
+		return category, nil
 	}
-	return category, err
+	return *cat, err
 }
 
 func getConfigByName(name string) (string, error) {
-	config := Config{}
-	err := dbx.Get(&config, "SELECT * FROM `configs` WHERE `name` = ?", name)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
-	if err != nil {
-		log.Print(err)
-		return "", err
-	}
-	return config.Val, err
+	return config[name], nil
 }
 
 func getPaymentServiceURL() string {
@@ -487,6 +549,10 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	templates.ExecuteTemplate(w, "index.html", struct{}{})
 }
 
+var (
+	categoryList = make(map[int]*Category)
+)
+
 func postInitialize(w http.ResponseWriter, r *http.Request) {
 	ri := reqInitialize{}
 
@@ -505,32 +571,109 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
-	_, err = dbx.ExecContext(ctx,
-		"INSERT INTO `configs` (`name`, `val`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `val` = VALUES(`val`)",
-		"payment_service_url",
-		ri.PaymentServiceURL,
-	)
+	config["payment_service_url"] = ri.PaymentServiceURL
+	config["shipment_service_url"] = ri.ShipmentServiceURL
+
+	categoryList = make(map[int]*Category)
+	cateArr := []*Category{}
+	err = dbx.Select(&cateArr, "SELECT * FROM categories")
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
 		return
 	}
 
-	_, err = dbx.ExecContext(ctx,
-		"INSERT INTO `configs` (`name`, `val`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `val` = VALUES(`val`)",
-		"shipment_service_url",
-		ri.ShipmentServiceURL,
-	)
+	for _, cate := range cateArr {
+		categoryList[cate.ID] = cate
+	}
+
+	for _, cate := range categoryList {
+		if cate.ParentID != 0 {
+			cate.ParentCategoryName = categoryList[cate.ParentID].CategoryName
+		}
+	}
+
+	userMapMux.Lock()
+	defer userMapMux.Unlock()
+
+	userMap = make(map[int64]*User)
+	userArr := []*User{}
+	err = dbx.Select(&userArr, "SELECT * FROM users")
+
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
 		return
+	}
+
+	for _, user := range userArr {
+		userMap[user.ID] = user
 	}
 
 	res := resInitialize{
 		// キャンペーン実施時には還元率の設定を返す。詳しくはマニュアルを参照のこと。
-		Campaign: 0,
+		Campaign: 4,
+		// 実装言語を返す
+		Language: "Go",
+	}
+
+	w.Header().Set("Content-Type", "application/json;charset=utf-8")
+	json.NewEncoder(w).Encode(res)
+}
+
+func postInitializeOther(w http.ResponseWriter, r *http.Request) {
+	log.Print("OTHER")
+	ri := reqInitialize{}
+
+	err := json.NewDecoder(r.Body).Decode(&ri)
+	if err != nil {
+		outputErrorMsg(w, http.StatusBadRequest, "json decode error")
+		return
+	}
+	log.Print(ri)
+
+	config["payment_service_url"] = ri.PaymentServiceURL
+	config["shipment_service_url"] = ri.ShipmentServiceURL
+
+	categoryList = make(map[int]*Category)
+	cateArr := []*Category{}
+	err = dbx.Select(&cateArr, "SELECT * FROM categories")
+	if err != nil {
+		log.Print(err)
+		outputErrorMsg(w, http.StatusInternalServerError, "db error")
+		return
+	}
+
+	for _, cate := range cateArr {
+		categoryList[cate.ID] = cate
+	}
+
+	for _, cate := range categoryList {
+		if cate.ParentID != 0 {
+			cate.ParentCategoryName = categoryList[cate.ParentID].CategoryName
+		}
+	}
+
+	userMapMux.Lock()
+	defer userMapMux.Unlock()
+
+	userMap = make(map[int64]*User)
+	userArr := []*User{}
+	err = dbx.Select(&userArr, "SELECT * FROM users")
+
+	if err != nil {
+		log.Print(err)
+		outputErrorMsg(w, http.StatusInternalServerError, "db error")
+		return
+	}
+
+	for _, user := range userArr {
+		userMap[user.ID] = user
+	}
+
+	res := resInitialize{
+		// キャンペーン実施時には還元率の設定を返す。詳しくはマニュアルを参照のこと。
+		Campaign: 4,
 		// 実装言語を返す
 		Language: "Go",
 	}
@@ -913,19 +1056,46 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tx := dbx.MustBegin()
-	items := []Item{}
+	// items := []Item{}
+	var rows *sqlx.Rows
 	if itemID > 0 && createdAt > 0 {
 		// paging
-		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
-		err := tx.SelectContext(ctx, &items,
-			"SELECT * FROM `items` WHERE (`seller_id` = ? OR `buyer_id` = ?) AND `status` IN (?,?,?,?,?) AND (`created_at` < ?  OR (`created_at` <= ? AND `id` < ?)) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
+		rows, err = dbx.Queryx(
+			`SELECT 
+	items.id, 
+	items.seller_id, 
+	items.status,
+	items.name,
+	items.description,
+	items.image_name,
+	items.category_id,
+	items.created_at,
+	items.buyer_id,
+	te_ship.id as te_id,
+	te_ship.reserve_id,
+	te_ship.status as te_status
+FROM 
+	items 
+LEFT JOIN 
+	(
+		SELECT 
+			transaction_evidences.id,
+			transaction_evidences.item_id, 
+			transaction_evidences.status, 
+			shippings.reserve_id  
+		FROM 
+			transaction_evidences 
+		RIGHT JOIN 
+			shippings 
+		ON transaction_evidences.id = shippings.transaction_evidence_id
+	) AS te_ship ON items.id = te_ship.item_id 
+WHERE 
+	(seller_id = ? OR buyer_id = ?) 
+	AND (created_at < ?  OR (created_at <= ? AND items.id < ?)) 
+ORDER BY 
+	created_at DESC, items.id DESC LIMIT ?`,
 			user.ID,
 			user.ID,
-			ItemStatusOnSale,
-			ItemStatusTrading,
-			ItemStatusSoldOut,
-			ItemStatusCancel,
-			ItemStatusStop,
 			time.Unix(createdAt, 0),
 			time.Unix(createdAt, 0),
 			itemID,
@@ -939,16 +1109,40 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// 1st page
-		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
-		err := tx.SelectContext(ctx, &items,
-			"SELECT * FROM `items` WHERE (`seller_id` = ? OR `buyer_id` = ?) AND `status` IN (?,?,?,?,?) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
+		rows, err = dbx.Queryx(
+			`SELECT 
+	items.id, 
+	items.seller_id, 
+	items.status,
+	items.name,
+	items.description,
+	items.image_name,
+	items.category_id,
+	items.created_at,
+	items.buyer_id,
+	te_ship.id as te_id,
+	te_ship.reserve_id,
+	te_ship.status as te_status
+FROM 
+	items 
+LEFT JOIN 
+	(
+		SELECT 
+			transaction_evidences.id,
+			transaction_evidences.item_id, 
+			transaction_evidences.status, 
+			shippings.reserve_id  
+		FROM 
+			transaction_evidences 
+		RIGHT JOIN 
+			shippings 
+		ON transaction_evidences.id = shippings.transaction_evidence_id
+	) AS te_ship ON items.id = te_ship.item_id 
+WHERE 
+	(seller_id = ? OR buyer_id = ?) 
+ORDER BY created_at DESC, items.id DESC LIMIT ?`,
 			user.ID,
 			user.ID,
-			ItemStatusOnSale,
-			ItemStatusTrading,
-			ItemStatusSoldOut,
-			ItemStatusCancel,
-			ItemStatusStop,
 			TransactionsPerPage+1,
 		)
 		if err != nil {
@@ -959,8 +1153,33 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	itemDetails := []ItemDetail{}
-	for _, item := range items {
+	itemDetails := []*ItemDetail{}
+	wg := sync.WaitGroup{}
+	for rows.Next() {
+		item := Item{}
+		teID := sql.NullInt64{}
+		reserveID := sql.NullString{}
+		teStatus := sql.NullString{}
+		err := rows.Scan(
+			&item.ID,
+			&item.SellerID,
+			&item.Status,
+			&item.Name,
+			&item.Description,
+			&item.ImageName,
+			&item.CategoryID,
+			&item.CreatedAt,
+			&item.BuyerID,
+			&teID,
+			&reserveID,
+			&teStatus,
+		)
+		if err != nil {
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "db error")
+			return
+		}
+
 		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
 		seller, err := getUserSimpleByID(ctx, tx, item.SellerID)
 		if err != nil {
@@ -975,7 +1194,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		itemDetail := ItemDetail{
+		itemDetail := &ItemDetail{
 			ID:       item.ID,
 			SellerID: item.SellerID,
 			Seller:   &seller,
@@ -1006,49 +1225,32 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			itemDetail.Buyer = &buyer
 		}
 
-		transactionEvidence := TransactionEvidence{}
-		err = tx.GetContext(ctx, &transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
-		if err != nil && err != sql.ErrNoRows {
-			// It's able to ignore ErrNoRows
-			log.Print(err)
-			outputErrorMsg(w, http.StatusInternalServerError, "db error")
-			tx.Rollback()
-			return
+		if teID.Valid && reserveID.Valid {
+			teIDValue := teID.Int64
+			teStatusValue := teStatus.String
+			reserveIDValue := reserveID.String
+			itemDetail.TransactionEvidenceID = teIDValue
+			itemDetail.TransactionEvidenceStatus = teStatusValue
+
+			wg.Add(1)
+			go func() {
+				ssr, err := APIShipmentStatus(ctx, getShipmentServiceURL(), &APIShipmentStatusReq{
+					ReserveID: reserveIDValue,
+				})
+				if err != nil {
+					log.Print(err)
+					outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
+					return
+				}
+
+				itemDetail.ShippingStatus = ssr.Status
+				wg.Done()
+			}()
 		}
-
-		if transactionEvidence.ID > 0 {
-			shipping := Shipping{}
-			ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
-			err = tx.GetContext(ctx, &shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
-			if err == sql.ErrNoRows {
-				outputErrorMsg(w, http.StatusNotFound, "shipping not found")
-				tx.Rollback()
-				return
-			}
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "db error")
-				tx.Rollback()
-				return
-			}
-			ssr, err := APIShipmentStatus(ctx, getShipmentServiceURL(), &APIShipmentStatusReq{
-				ReserveID: shipping.ReserveID,
-			})
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-				tx.Rollback()
-				return
-			}
-
-			itemDetail.TransactionEvidenceID = transactionEvidence.ID
-			itemDetail.TransactionEvidenceStatus = transactionEvidence.Status
-			itemDetail.ShippingStatus = ssr.Status
-		}
-
 		itemDetails = append(itemDetails, itemDetail)
 	}
 	tx.Commit()
+	wg.Wait()
 
 	hasNext := false
 	if len(itemDetails) > TransactionsPerPage {
@@ -1437,29 +1639,41 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scr, err := APIShipmentCreate(ctx, getShipmentServiceURL(), &APIShipmentCreateReq{
-		ToAddress:   buyer.Address,
-		ToName:      buyer.AccountName,
-		FromAddress: seller.Address,
-		FromName:    seller.AccountName,
-	})
-	if err != nil {
-		log.Print(err)
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	var scr *APIShipmentCreateRes
+	var shipErr error
+	go func() {
+		scr, shipErr = APIShipmentCreate(ctx, getShipmentServiceURL(), &APIShipmentCreateReq{
+			ToAddress:   buyer.Address,
+			ToName:      buyer.AccountName,
+			FromAddress: seller.Address,
+			FromName:    seller.AccountName,
+		})
+		wg.Done()
+	}()
+	var pstr *APIPaymentServiceTokenRes
+	var payErr error
+	go func() {
+		pstr, payErr = APIPaymentToken(ctx, getPaymentServiceURL(), &APIPaymentServiceTokenReq{
+			ShopID: PaymentServiceIsucariShopID,
+			Token:  rb.Token,
+			APIKey: PaymentServiceIsucariAPIKey,
+			Price:  targetItem.Price,
+		})
+		wg.Done()
+	}()
+	wg.Wait()
+
+	if shipErr != nil {
+		log.Print(shipErr)
 		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
 		tx.Rollback()
-
 		return
 	}
 
-	pstr, err := APIPaymentToken(ctx, getPaymentServiceURL(), &APIPaymentServiceTokenReq{
-		ShopID: PaymentServiceIsucariShopID,
-		Token:  rb.Token,
-		APIKey: PaymentServiceIsucariAPIKey,
-		Price:  targetItem.Price,
-	})
-	if err != nil {
-		log.Print(err)
-
+	if payErr != nil {
+		log.Print(payErr)
 		outputErrorMsg(w, http.StatusInternalServerError, "payment service is failed")
 		tx.Rollback()
 		return
@@ -1555,6 +1769,31 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 
 	tx := dbx.MustBegin()
 
+	shipping := Shipping{}
+	err = tx.GetContext(ctx, &shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ? FOR UPDATE", transactionEvidence.ID)
+	if err == sql.ErrNoRows {
+		outputErrorMsg(w, http.StatusNotFound, "shippings not found")
+		tx.Rollback()
+		return
+	}
+	if err != nil {
+		log.Print(err)
+		outputErrorMsg(w, http.StatusInternalServerError, "db error")
+		tx.Rollback()
+		return
+	}
+	var poiErr error
+	var img []byte
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+
+		img, poiErr = APIShipmentRequest(ctx, getShipmentServiceURL(), &APIShipmentRequestReq{
+			ReserveID: shipping.ReserveID,
+		})
+		wg.Done()
+	}()
+
 	item := Item{}
 	err = tx.GetContext(ctx, &item, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
 	if err == sql.ErrNoRows {
@@ -1594,28 +1833,11 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	shipping := Shipping{}
-	err = tx.GetContext(ctx, &shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ? FOR UPDATE", transactionEvidence.ID)
-	if err == sql.ErrNoRows {
-		outputErrorMsg(w, http.StatusNotFound, "shippings not found")
-		tx.Rollback()
-		return
-	}
-	if err != nil {
-		log.Print(err)
-		outputErrorMsg(w, http.StatusInternalServerError, "db error")
-		tx.Rollback()
-		return
-	}
-
-	img, err := APIShipmentRequest(ctx, getShipmentServiceURL(), &APIShipmentRequestReq{
-		ReserveID: shipping.ReserveID,
-	})
-	if err != nil {
-		log.Print(err)
+	wg.Wait()
+	if poiErr != nil {
+		log.Print(poiErr)
 		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
 		tx.Rollback()
-
 		return
 	}
 
@@ -1881,23 +2103,16 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ssr, err := APIShipmentStatus(ctx, getShipmentServiceURL(), &APIShipmentStatusReq{
-		ReserveID: shipping.ReserveID,
-	})
-	if err != nil {
-		log.Print(err)
-		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-		tx.Rollback()
-
-		return
-	}
-
-	if !(ssr.Status == ShippingsStatusDone) {
-		outputErrorMsg(w, http.StatusBadRequest, "shipment service側で配送完了になっていません")
-		tx.Rollback()
-		return
-	}
-
+	var ssr *APIShipmentStatusRes
+	var ssrErr error
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		ssr, ssrErr = APIShipmentStatus(ctx, getShipmentServiceURL(), &APIShipmentStatusReq{
+			ReserveID: shipping.ReserveID,
+		})
+		wg.Done()
+	}()
 	_, err = tx.ExecContext(ctx, "UPDATE `shippings` SET `status` = ?, `updated_at` = ? WHERE `transaction_evidence_id` = ?",
 		ShippingsStatusDone,
 		time.Now(),
@@ -1933,6 +2148,20 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
+		tx.Rollback()
+		return
+	}
+
+	wg.Wait()
+	if ssrErr != nil {
+		log.Print(ssrErr)
+		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
+		tx.Rollback()
+		return
+	}
+
+	if !(ssr.Status == ShippingsStatusDone) {
+		outputErrorMsg(w, http.StatusBadRequest, "shipment service側で配送完了になっていません")
 		tx.Rollback()
 		return
 	}
@@ -2068,8 +2297,7 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	_, err = tx.ExecContext(ctx, "UPDATE `users` SET `num_sell_items`=?, `last_bump`=? WHERE `id`=?",
-		seller.NumSellItems+1,
+	_, err = tx.ExecContext(ctx, "UPDATE `users` SET `num_sell_items`=num_sell_items+1, `last_bump`=? WHERE `id`=?",
 		now,
 		seller.ID,
 	)
@@ -2080,6 +2308,10 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tx.Commit()
+	userMapMux.Lock()
+	userMap[seller.ID].LastBump = now
+	userMap[seller.ID].NumSellItems++
+	userMapMux.Unlock()
 
 	w.Header().Set("Content-Type", "application/json;charset=utf-8")
 	json.NewEncoder(w).Encode(resSell{ID: itemID})
@@ -2339,6 +2571,8 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		AccountName: accountName,
 		Address:     address,
 	}
+
+	getUserSimpleByID(ctx, dbx, userID)
 
 	session := getSession(r)
 	session.Values["user_id"] = u.ID
