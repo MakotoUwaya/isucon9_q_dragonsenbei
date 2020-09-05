@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -15,12 +16,14 @@ import (
 	"strconv"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
 	goji "goji.io"
 	"goji.io/pat"
 	"golang.org/x/crypto/bcrypt"
+
+	_ "github.com/newrelic/go-agent/v3/integrations/nrmysql"
+	"github.com/newrelic/go-agent/v3/newrelic"
 )
 
 const (
@@ -63,6 +66,7 @@ var (
 	templates *template.Template
 	dbx       *sqlx.DB
 	store     sessions.Store
+	app       *newrelic.Application
 )
 
 type Config struct {
@@ -268,6 +272,20 @@ type resSetting struct {
 	Categories        []Category `json:"categories"`
 }
 
+func nrt(inner http.Handler) http.Handler {
+	mw := func(w http.ResponseWriter, r *http.Request) {
+		txn := app.StartTransaction(r.URL.Path)
+		defer txn.End()
+
+		r = newrelic.RequestWithTransactionContext(r, txn)
+
+		txn.SetWebRequestHTTP(r)
+		w = txn.SetWebResponse(w)
+		inner.ServeHTTP(w, r)
+	}
+	return http.HandlerFunc(mw)
+}
+
 func init() {
 	store = sessions.NewCookieStore([]byte("abc"))
 
@@ -279,6 +297,17 @@ func init() {
 }
 
 func main() {
+	var err error
+	app, err = newrelic.NewApplication(
+		newrelic.ConfigAppName("ISUCON9-q-uwaya"),
+		newrelic.ConfigLicense(os.Getenv("NEW_RELIC_LICENSE_KEY")),
+		newrelic.ConfigDebugLogger(os.Stdout),
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
 	host := os.Getenv("MYSQL_HOST")
 	if host == "" {
 		host = "127.0.0.1"
@@ -287,7 +316,7 @@ func main() {
 	if port == "" {
 		port = "3306"
 	}
-	_, err := strconv.Atoi(port)
+	_, err = strconv.Atoi(port)
 	if err != nil {
 		log.Fatalf("failed to read DB port number from an environment variable MYSQL_PORT.\nError: %s", err.Error())
 	}
@@ -313,13 +342,14 @@ func main() {
 		dbname,
 	)
 
-	dbx, err = sqlx.Open("mysql", dsn)
+	dbx, err = sqlx.Open("nrmysql", dsn)
 	if err != nil {
 		log.Fatalf("failed to connect to DB: %s.", err.Error())
 	}
 	defer dbx.Close()
 
 	mux := goji.NewMux()
+	mux.Use(nrt)
 
 	// API
 	mux.HandleFunc(pat.Post("/initialize"), postInitialize)
@@ -383,7 +413,8 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 		return user, http.StatusNotFound, "no session"
 	}
 
-	err := dbx.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", userID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err := dbx.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err == sql.ErrNoRows {
 		return user, http.StatusNotFound, "user not found"
 	}
@@ -395,9 +426,13 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 	return user, http.StatusOK, ""
 }
 
-func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err error) {
+type SQLDB interface {
+	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+}
+
+func getUserSimpleByID(ctx context.Context, q SQLDB, userID int64) (userSimple UserSimple, err error) {
 	user := User{}
-	err = sqlx.Get(q, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
+	err = q.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err != nil {
 		return userSimple, err
 	}
@@ -407,10 +442,10 @@ func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err
 	return userSimple, err
 }
 
-func getCategoryByID(q sqlx.Queryer, categoryID int) (category Category, err error) {
-	err = sqlx.Get(q, &category, "SELECT * FROM `categories` WHERE `id` = ?", categoryID)
+func getCategoryByID(ctx context.Context, q SQLDB, categoryID int) (category Category, err error) {
+	err = q.GetContext(ctx, &category, "SELECT * FROM `categories` WHERE `id` = ?", categoryID)
 	if category.ParentID != 0 {
-		parentCategory, err := getCategoryByID(q, category.ParentID)
+		parentCategory, err := getCategoryByID(ctx, q, category.ParentID)
 		if err != nil {
 			return category, err
 		}
@@ -470,7 +505,8 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = dbx.Exec(
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	_, err = dbx.ExecContext(ctx,
 		"INSERT INTO `configs` (`name`, `val`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `val` = VALUES(`val`)",
 		"payment_service_url",
 		ri.PaymentServiceURL,
@@ -480,7 +516,8 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
 		return
 	}
-	_, err = dbx.Exec(
+
+	_, err = dbx.ExecContext(ctx,
 		"INSERT INTO `configs` (`name`, `val`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `val` = VALUES(`val`)",
 		"shipment_service_url",
 		ri.ShipmentServiceURL,
@@ -528,7 +565,8 @@ func getNewItems(w http.ResponseWriter, r *http.Request) {
 	items := []Item{}
 	if itemID > 0 && createdAt > 0 {
 		// paging
-		err := dbx.Select(&items,
+		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+		err := dbx.SelectContext(ctx, &items,
 			"SELECT * FROM `items` WHERE `status` IN (?,?) AND (`created_at` < ?  OR (`created_at` <= ? AND `id` < ?)) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
 			ItemStatusOnSale,
 			ItemStatusSoldOut,
@@ -544,7 +582,8 @@ func getNewItems(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// 1st page
-		err := dbx.Select(&items,
+		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+		err := dbx.SelectContext(ctx, &items,
 			"SELECT * FROM `items` WHERE `status` IN (?,?) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
 			ItemStatusOnSale,
 			ItemStatusSoldOut,
@@ -559,12 +598,13 @@ func getNewItems(w http.ResponseWriter, r *http.Request) {
 
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		seller, err := getUserSimpleByID(dbx, item.SellerID)
+		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+		seller, err := getUserSimpleByID(ctx, dbx, item.SellerID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
-		category, err := getCategoryByID(dbx, item.CategoryID)
+		category, err := getCategoryByID(ctx, dbx, item.CategoryID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
@@ -606,14 +646,15 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rootCategory, err := getCategoryByID(dbx, rootCategoryID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	rootCategory, err := getCategoryByID(ctx, dbx, rootCategoryID)
 	if err != nil || rootCategory.ParentID != 0 {
 		outputErrorMsg(w, http.StatusNotFound, "category not found")
 		return
 	}
 
 	var categoryIDs []int
-	err = dbx.Select(&categoryIDs, "SELECT id FROM `categories` WHERE parent_id=?", rootCategory.ID)
+	err = dbx.SelectContext(ctx, &categoryIDs, "SELECT id FROM `categories` WHERE parent_id=?", rootCategory.ID)
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
@@ -677,7 +718,7 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 	}
 
 	items := []Item{}
-	err = dbx.Select(&items, inQuery, inArgs...)
+	err = dbx.SelectContext(ctx, &items, inQuery, inArgs...)
 
 	if err != nil {
 		log.Print(err)
@@ -687,12 +728,12 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		seller, err := getUserSimpleByID(dbx, item.SellerID)
+		seller, err := getUserSimpleByID(ctx, dbx, item.SellerID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
-		category, err := getCategoryByID(dbx, item.CategoryID)
+		category, err := getCategoryByID(ctx, dbx, item.CategoryID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
@@ -737,7 +778,8 @@ func getUserItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userSimple, err := getUserSimpleByID(dbx, userID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	userSimple, err := getUserSimpleByID(ctx, dbx, userID)
 	if err != nil {
 		outputErrorMsg(w, http.StatusNotFound, "user not found")
 		return
@@ -767,7 +809,8 @@ func getUserItems(w http.ResponseWriter, r *http.Request) {
 	items := []Item{}
 	if itemID > 0 && createdAt > 0 {
 		// paging
-		err := dbx.Select(&items,
+		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+		err := dbx.SelectContext(ctx, &items,
 			"SELECT * FROM `items` WHERE `seller_id` = ? AND `status` IN (?,?,?) AND (`created_at` < ?  OR (`created_at` <= ? AND `id` < ?)) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
 			userSimple.ID,
 			ItemStatusOnSale,
@@ -785,7 +828,8 @@ func getUserItems(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// 1st page
-		err := dbx.Select(&items,
+		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+		err := dbx.SelectContext(ctx, &items,
 			"SELECT * FROM `items` WHERE `seller_id` = ? AND `status` IN (?,?,?) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
 			userSimple.ID,
 			ItemStatusOnSale,
@@ -802,7 +846,8 @@ func getUserItems(w http.ResponseWriter, r *http.Request) {
 
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		category, err := getCategoryByID(dbx, item.CategoryID)
+		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+		category, err := getCategoryByID(ctx, dbx, item.CategoryID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
@@ -871,7 +916,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	items := []Item{}
 	if itemID > 0 && createdAt > 0 {
 		// paging
-		err := tx.Select(&items,
+		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+		err := tx.SelectContext(ctx, &items,
 			"SELECT * FROM `items` WHERE (`seller_id` = ? OR `buyer_id` = ?) AND `status` IN (?,?,?,?,?) AND (`created_at` < ?  OR (`created_at` <= ? AND `id` < ?)) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
 			user.ID,
 			user.ID,
@@ -893,7 +939,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// 1st page
-		err := tx.Select(&items,
+		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+		err := tx.SelectContext(ctx, &items,
 			"SELECT * FROM `items` WHERE (`seller_id` = ? OR `buyer_id` = ?) AND `status` IN (?,?,?,?,?) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
 			user.ID,
 			user.ID,
@@ -914,13 +961,14 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 
 	itemDetails := []ItemDetail{}
 	for _, item := range items {
-		seller, err := getUserSimpleByID(tx, item.SellerID)
+		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+		seller, err := getUserSimpleByID(ctx, tx, item.SellerID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			tx.Rollback()
 			return
 		}
-		category, err := getCategoryByID(tx, item.CategoryID)
+		category, err := getCategoryByID(ctx, tx, item.CategoryID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			tx.Rollback()
@@ -947,7 +995,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if item.BuyerID != 0 {
-			buyer, err := getUserSimpleByID(tx, item.BuyerID)
+			ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+			buyer, err := getUserSimpleByID(ctx, tx, item.BuyerID)
 			if err != nil {
 				outputErrorMsg(w, http.StatusNotFound, "buyer not found")
 				tx.Rollback()
@@ -958,7 +1007,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		transactionEvidence := TransactionEvidence{}
-		err = tx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
+		err = tx.GetContext(ctx, &transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
 		if err != nil && err != sql.ErrNoRows {
 			// It's able to ignore ErrNoRows
 			log.Print(err)
@@ -969,7 +1018,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 
 		if transactionEvidence.ID > 0 {
 			shipping := Shipping{}
-			err = tx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
+			ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+			err = tx.GetContext(ctx, &shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
 			if err == sql.ErrNoRows {
 				outputErrorMsg(w, http.StatusNotFound, "shipping not found")
 				tx.Rollback()
@@ -981,7 +1031,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 				tx.Rollback()
 				return
 			}
-			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
+			ssr, err := APIShipmentStatus(ctx, getShipmentServiceURL(), &APIShipmentStatusReq{
 				ReserveID: shipping.ReserveID,
 			})
 			if err != nil {
@@ -1031,7 +1081,8 @@ func getItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	item := Item{}
-	err = dbx.Get(&item, "SELECT * FROM `items` WHERE `id` = ?", itemID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err = dbx.GetContext(ctx, &item, "SELECT * FROM `items` WHERE `id` = ?", itemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "item not found")
 		return
@@ -1042,13 +1093,13 @@ func getItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	category, err := getCategoryByID(dbx, item.CategoryID)
+	category, err := getCategoryByID(ctx, dbx, item.CategoryID)
 	if err != nil {
 		outputErrorMsg(w, http.StatusNotFound, "category not found")
 		return
 	}
 
-	seller, err := getUserSimpleByID(dbx, item.SellerID)
+	seller, err := getUserSimpleByID(ctx, dbx, item.SellerID)
 	if err != nil {
 		outputErrorMsg(w, http.StatusNotFound, "seller not found")
 		return
@@ -1074,7 +1125,8 @@ func getItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if (user.ID == item.SellerID || user.ID == item.BuyerID) && item.BuyerID != 0 {
-		buyer, err := getUserSimpleByID(dbx, item.BuyerID)
+		ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+		buyer, err := getUserSimpleByID(ctx, dbx, item.BuyerID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "buyer not found")
 			return
@@ -1083,7 +1135,7 @@ func getItem(w http.ResponseWriter, r *http.Request) {
 		itemDetail.Buyer = &buyer
 
 		transactionEvidence := TransactionEvidence{}
-		err = dbx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
+		err = dbx.GetContext(ctx, &transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
 		if err != nil && err != sql.ErrNoRows {
 			// It's able to ignore ErrNoRows
 			log.Print(err)
@@ -1093,7 +1145,8 @@ func getItem(w http.ResponseWriter, r *http.Request) {
 
 		if transactionEvidence.ID > 0 {
 			shipping := Shipping{}
-			err = dbx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
+			ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+			err = dbx.GetContext(ctx, &shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
 			if err == sql.ErrNoRows {
 				outputErrorMsg(w, http.StatusNotFound, "shipping not found")
 				return
@@ -1144,7 +1197,8 @@ func postItemEdit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetItem := Item{}
-	err = dbx.Get(&targetItem, "SELECT * FROM `items` WHERE `id` = ?", itemID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err = dbx.GetContext(ctx, &targetItem, "SELECT * FROM `items` WHERE `id` = ?", itemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "item not found")
 		return
@@ -1162,7 +1216,7 @@ func postItemEdit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tx := dbx.MustBegin()
-	err = tx.Get(&targetItem, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
+	err = tx.GetContext(ctx, &targetItem, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
 	if err != nil {
 		log.Print(err)
 
@@ -1177,7 +1231,7 @@ func postItemEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `items` SET `price` = ?, `updated_at` = ? WHERE `id` = ?",
+	_, err = tx.ExecContext(ctx, "UPDATE `items` SET `price` = ?, `updated_at` = ? WHERE `id` = ?",
 		price,
 		time.Now(),
 		itemID,
@@ -1190,7 +1244,7 @@ func postItemEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = tx.Get(&targetItem, "SELECT * FROM `items` WHERE `id` = ?", itemID)
+	err = tx.GetContext(ctx, &targetItem, "SELECT * FROM `items` WHERE `id` = ?", itemID)
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
@@ -1224,7 +1278,8 @@ func getQRCode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	transactionEvidence := TransactionEvidence{}
-	err = dbx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `id` = ?", transactionEvidenceID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err = dbx.GetContext(ctx, &transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `id` = ?", transactionEvidenceID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "transaction_evidences not found")
 		return
@@ -1241,7 +1296,7 @@ func getQRCode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	shipping := Shipping{}
-	err = dbx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
+	err = dbx.GetContext(ctx, &shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "shippings not found")
 		return
@@ -1289,7 +1344,8 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 	tx := dbx.MustBegin()
 
 	targetItem := Item{}
-	err = tx.Get(&targetItem, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", rb.ItemID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err = tx.GetContext(ctx, &targetItem, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", rb.ItemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "item not found")
 		tx.Rollback()
@@ -1316,7 +1372,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	seller := User{}
-	err = tx.Get(&seller, "SELECT * FROM `users` WHERE `id` = ? FOR UPDATE", targetItem.SellerID)
+	err = tx.GetContext(ctx, &seller, "SELECT * FROM `users` WHERE `id` = ? FOR UPDATE", targetItem.SellerID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "seller not found")
 		tx.Rollback()
@@ -1330,7 +1386,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	category, err := getCategoryByID(tx, targetItem.CategoryID)
+	category, err := getCategoryByID(ctx, tx, targetItem.CategoryID)
 	if err != nil {
 		log.Print(err)
 
@@ -1339,7 +1395,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := tx.Exec("INSERT INTO `transaction_evidences` (`seller_id`, `buyer_id`, `status`, `item_id`, `item_name`, `item_price`, `item_description`,`item_category_id`,`item_root_category_id`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+	result, err := tx.ExecContext(ctx, "INSERT INTO `transaction_evidences` (`seller_id`, `buyer_id`, `status`, `item_id`, `item_name`, `item_price`, `item_description`,`item_category_id`,`item_root_category_id`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		targetItem.SellerID,
 		buyer.ID,
 		TransactionEvidenceStatusWaitShipping,
@@ -1367,7 +1423,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `items` SET `buyer_id` = ?, `status` = ?, `updated_at` = ? WHERE `id` = ?",
+	_, err = tx.ExecContext(ctx, "UPDATE `items` SET `buyer_id` = ?, `status` = ?, `updated_at` = ? WHERE `id` = ?",
 		buyer.ID,
 		ItemStatusTrading,
 		time.Now(),
@@ -1381,7 +1437,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scr, err := APIShipmentCreate(getShipmentServiceURL(), &APIShipmentCreateReq{
+	scr, err := APIShipmentCreate(ctx, getShipmentServiceURL(), &APIShipmentCreateReq{
 		ToAddress:   buyer.Address,
 		ToName:      buyer.AccountName,
 		FromAddress: seller.Address,
@@ -1395,7 +1451,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pstr, err := APIPaymentToken(getPaymentServiceURL(), &APIPaymentServiceTokenReq{
+	pstr, err := APIPaymentToken(ctx, getPaymentServiceURL(), &APIPaymentServiceTokenReq{
 		ShopID: PaymentServiceIsucariShopID,
 		Token:  rb.Token,
 		APIKey: PaymentServiceIsucariAPIKey,
@@ -1427,7 +1483,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("INSERT INTO `shippings` (`transaction_evidence_id`, `status`, `item_name`, `item_id`, `reserve_id`, `reserve_time`, `to_address`, `to_name`, `from_address`, `from_name`, `img_binary`) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+	_, err = tx.ExecContext(ctx, "INSERT INTO `shippings` (`transaction_evidence_id`, `status`, `item_name`, `item_id`, `reserve_id`, `reserve_time`, `to_address`, `to_name`, `from_address`, `from_name`, `img_binary`) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
 		transactionEvidenceID,
 		ShippingsStatusInitial,
 		targetItem.Name,
@@ -1479,7 +1535,8 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 	}
 
 	transactionEvidence := TransactionEvidence{}
-	err = dbx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", itemID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err = dbx.GetContext(ctx, &transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", itemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "transaction_evidences not found")
 		return
@@ -1499,7 +1556,7 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 	tx := dbx.MustBegin()
 
 	item := Item{}
-	err = tx.Get(&item, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
+	err = tx.GetContext(ctx, &item, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "item not found")
 		tx.Rollback()
@@ -1518,7 +1575,7 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = tx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `id` = ? FOR UPDATE", transactionEvidence.ID)
+	err = tx.GetContext(ctx, &transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `id` = ? FOR UPDATE", transactionEvidence.ID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "transaction_evidences not found")
 		tx.Rollback()
@@ -1538,7 +1595,7 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 	}
 
 	shipping := Shipping{}
-	err = tx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ? FOR UPDATE", transactionEvidence.ID)
+	err = tx.GetContext(ctx, &shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ? FOR UPDATE", transactionEvidence.ID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "shippings not found")
 		tx.Rollback()
@@ -1551,7 +1608,7 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	img, err := APIShipmentRequest(getShipmentServiceURL(), &APIShipmentRequestReq{
+	img, err := APIShipmentRequest(ctx, getShipmentServiceURL(), &APIShipmentRequestReq{
 		ReserveID: shipping.ReserveID,
 	})
 	if err != nil {
@@ -1562,7 +1619,7 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `shippings` SET `status` = ?, `img_binary` = ?, `updated_at` = ? WHERE `transaction_evidence_id` = ?",
+	_, err = tx.ExecContext(ctx, "UPDATE `shippings` SET `status` = ?, `img_binary` = ?, `updated_at` = ? WHERE `transaction_evidence_id` = ?",
 		ShippingsStatusWaitPickup,
 		img,
 		time.Now(),
@@ -1610,7 +1667,8 @@ func postShipDone(w http.ResponseWriter, r *http.Request) {
 	}
 
 	transactionEvidence := TransactionEvidence{}
-	err = dbx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", itemID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err = dbx.GetContext(ctx, &transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", itemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "transaction_evidence not found")
 		return
@@ -1630,7 +1688,7 @@ func postShipDone(w http.ResponseWriter, r *http.Request) {
 	tx := dbx.MustBegin()
 
 	item := Item{}
-	err = tx.Get(&item, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
+	err = tx.GetContext(ctx, &item, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "items not found")
 		tx.Rollback()
@@ -1649,7 +1707,7 @@ func postShipDone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = tx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `id` = ? FOR UPDATE", transactionEvidence.ID)
+	err = tx.GetContext(ctx, &transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `id` = ? FOR UPDATE", transactionEvidence.ID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "transaction_evidences not found")
 		tx.Rollback()
@@ -1669,7 +1727,7 @@ func postShipDone(w http.ResponseWriter, r *http.Request) {
 	}
 
 	shipping := Shipping{}
-	err = tx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ? FOR UPDATE", transactionEvidence.ID)
+	err = tx.GetContext(ctx, &shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ? FOR UPDATE", transactionEvidence.ID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "shippings not found")
 		tx.Rollback()
@@ -1682,7 +1740,7 @@ func postShipDone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
+	ssr, err := APIShipmentStatus(ctx, getShipmentServiceURL(), &APIShipmentStatusReq{
 		ReserveID: shipping.ReserveID,
 	})
 	if err != nil {
@@ -1699,7 +1757,7 @@ func postShipDone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `shippings` SET `status` = ?, `updated_at` = ? WHERE `transaction_evidence_id` = ?",
+	_, err = tx.ExecContext(ctx, "UPDATE `shippings` SET `status` = ?, `updated_at` = ? WHERE `transaction_evidence_id` = ?",
 		ssr.Status,
 		time.Now(),
 		transactionEvidence.ID,
@@ -1712,7 +1770,7 @@ func postShipDone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `transaction_evidences` SET `status` = ?, `updated_at` = ? WHERE `id` = ?",
+	_, err = tx.ExecContext(ctx, "UPDATE `transaction_evidences` SET `status` = ?, `updated_at` = ? WHERE `id` = ?",
 		TransactionEvidenceStatusWaitDone,
 		time.Now(),
 		transactionEvidence.ID,
@@ -1756,7 +1814,8 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	transactionEvidence := TransactionEvidence{}
-	err = dbx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", itemID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err = dbx.GetContext(ctx, &transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", itemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "transaction_evidence not found")
 		return
@@ -1775,7 +1834,7 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 
 	tx := dbx.MustBegin()
 	item := Item{}
-	err = tx.Get(&item, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
+	err = tx.GetContext(ctx, &item, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "items not found")
 		tx.Rollback()
@@ -1794,7 +1853,7 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = tx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ? FOR UPDATE", itemID)
+	err = tx.GetContext(ctx, &transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ? FOR UPDATE", itemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "transaction_evidences not found")
 		tx.Rollback()
@@ -1814,7 +1873,7 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	shipping := Shipping{}
-	err = tx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ? FOR UPDATE", transactionEvidence.ID)
+	err = tx.GetContext(ctx, &shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ? FOR UPDATE", transactionEvidence.ID)
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
@@ -1822,7 +1881,7 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
+	ssr, err := APIShipmentStatus(ctx, getShipmentServiceURL(), &APIShipmentStatusReq{
 		ReserveID: shipping.ReserveID,
 	})
 	if err != nil {
@@ -1839,7 +1898,7 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `shippings` SET `status` = ?, `updated_at` = ? WHERE `transaction_evidence_id` = ?",
+	_, err = tx.ExecContext(ctx, "UPDATE `shippings` SET `status` = ?, `updated_at` = ? WHERE `transaction_evidence_id` = ?",
 		ShippingsStatusDone,
 		time.Now(),
 		transactionEvidence.ID,
@@ -1852,7 +1911,7 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `transaction_evidences` SET `status` = ?, `updated_at` = ? WHERE `id` = ?",
+	_, err = tx.ExecContext(ctx, "UPDATE `transaction_evidences` SET `status` = ?, `updated_at` = ? WHERE `id` = ?",
 		TransactionEvidenceStatusDone,
 		time.Now(),
 		transactionEvidence.ID,
@@ -1865,7 +1924,7 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `items` SET `status` = ?, `updated_at` = ? WHERE `id` = ?",
+	_, err = tx.ExecContext(ctx, "UPDATE `items` SET `status` = ?, `updated_at` = ? WHERE `id` = ?",
 		ItemStatusSoldOut,
 		time.Now(),
 		itemID,
@@ -1928,7 +1987,8 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	category, err := getCategoryByID(dbx, categoryID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	category, err := getCategoryByID(ctx, dbx, categoryID)
 	if err != nil || category.ParentID == 0 {
 		log.Print(categoryID, category)
 		outputErrorMsg(w, http.StatusBadRequest, "Incorrect category ID")
@@ -1970,7 +2030,7 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 	tx := dbx.MustBegin()
 
 	seller := User{}
-	err = tx.Get(&seller, "SELECT * FROM `users` WHERE `id` = ? FOR UPDATE", user.ID)
+	err = tx.GetContext(ctx, &seller, "SELECT * FROM `users` WHERE `id` = ? FOR UPDATE", user.ID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "user not found")
 		tx.Rollback()
@@ -1983,7 +2043,7 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := tx.Exec("INSERT INTO `items` (`seller_id`, `status`, `name`, `price`, `description`,`image_name`,`category_id`) VALUES (?, ?, ?, ?, ?, ?, ?)",
+	result, err := tx.ExecContext(ctx, "INSERT INTO `items` (`seller_id`, `status`, `name`, `price`, `description`,`image_name`,`category_id`) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		seller.ID,
 		ItemStatusOnSale,
 		name,
@@ -2008,7 +2068,7 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	_, err = tx.Exec("UPDATE `users` SET `num_sell_items`=?, `last_bump`=? WHERE `id`=?",
+	_, err = tx.ExecContext(ctx, "UPDATE `users` SET `num_sell_items`=?, `last_bump`=? WHERE `id`=?",
 		seller.NumSellItems+1,
 		now,
 		seller.ID,
@@ -2058,7 +2118,8 @@ func postBump(w http.ResponseWriter, r *http.Request) {
 	tx := dbx.MustBegin()
 
 	targetItem := Item{}
-	err = tx.Get(&targetItem, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err = tx.GetContext(ctx, &targetItem, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", itemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "item not found")
 		tx.Rollback()
@@ -2078,7 +2139,7 @@ func postBump(w http.ResponseWriter, r *http.Request) {
 	}
 
 	seller := User{}
-	err = tx.Get(&seller, "SELECT * FROM `users` WHERE `id` = ? FOR UPDATE", user.ID)
+	err = tx.GetContext(ctx, &seller, "SELECT * FROM `users` WHERE `id` = ? FOR UPDATE", user.ID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "user not found")
 		tx.Rollback()
@@ -2099,7 +2160,7 @@ func postBump(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `items` SET `created_at`=?, `updated_at`=? WHERE id=?",
+	_, err = tx.ExecContext(ctx, "UPDATE `items` SET `created_at`=?, `updated_at`=? WHERE id=?",
 		now,
 		now,
 		targetItem.ID,
@@ -2110,7 +2171,7 @@ func postBump(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec("UPDATE `users` SET `last_bump`=? WHERE id=?",
+	_, err = tx.ExecContext(ctx, "UPDATE `users` SET `last_bump`=? WHERE id=?",
 		now,
 		seller.ID,
 	)
@@ -2120,7 +2181,7 @@ func postBump(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = tx.Get(&targetItem, "SELECT * FROM `items` WHERE `id` = ?", itemID)
+	err = tx.GetContext(ctx, &targetItem, "SELECT * FROM `items` WHERE `id` = ?", itemID)
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
@@ -2154,7 +2215,8 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 
 	categories := []Category{}
 
-	err := dbx.Select(&categories, "SELECT * FROM `categories`")
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err := dbx.SelectContext(ctx, &categories, "SELECT * FROM `categories`")
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
@@ -2184,7 +2246,8 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	u := User{}
-	err = dbx.Get(&u, "SELECT * FROM `users` WHERE `account_name` = ?", accountName)
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err = dbx.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `account_name` = ?", accountName)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusUnauthorized, "アカウント名かパスワードが間違えています")
 		return
@@ -2249,7 +2312,8 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := dbx.Exec("INSERT INTO `users` (`account_name`, `hashed_password`, `address`) VALUES (?, ?, ?)",
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	result, err := dbx.ExecContext(ctx, "INSERT INTO `users` (`account_name`, `hashed_password`, `address`) VALUES (?, ?, ?)",
 		accountName,
 		hashedPassword,
 		address,
@@ -2291,7 +2355,8 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 
 func getReports(w http.ResponseWriter, r *http.Request) {
 	transactionEvidences := make([]TransactionEvidence, 0)
-	err := dbx.Select(&transactionEvidences, "SELECT * FROM `transaction_evidences` WHERE `id` > 15007")
+	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
+	err := dbx.SelectContext(ctx, &transactionEvidences, "SELECT * FROM `transaction_evidences` WHERE `id` > 15007")
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
