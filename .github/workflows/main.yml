@@ -1,11 +1,21 @@
-name: "build/deploy isucari"
+# デプロイ前に以下を secrets に設定する必要があります:
+#
+# * SSH_HOST_1 (and SSH_HOST_2, ...)
+# * SSH_KEY
+# * NEW_RELIC_API_KEY
+# * NEW_RELIC_ACCOUNT_ID
+# * NEW_RELIC_APPLICATION_ID_1 (and NEW_RELIC_APPLICATION_ID_2, ...)
+# * DISCORD_WEBHOOK
+#
+
+name: "build/deploy artifact"
 on: [push]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: golang:1.14.6-buster
+      image: golang:1.14.6-buster  # TODO EDIT BEFORE DEPLOY
     steps:
       - uses: actions/checkout@v1
       - name: build binary
@@ -16,11 +26,12 @@ jobs:
         uses: actions/upload-artifact@v1
         with:
           name: executable
-          path: webapp/go/isucari
+          path: webapp/go/binary
       - name: notify build failure
+        uses: sarisia/actions-status-discord@v1
         if: failure()
-        run: |
-          echo "$GITHUB_REF のビルドは失敗しました。"
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
   deploy:
     needs: [build]
     runs-on: ubuntu-latest
@@ -37,12 +48,26 @@ jobs:
         with:
           name: executable
           path: executable
+##### 複数台にデプロイする場合はここから下をコピーする #####
+      - name: create newelic deployment marker
+        uses: newrelic/deployment-marker-action@v1
+        with:
+          apiKey: ${{ secrets.NEW_RELIC_API_KEY }}
+          accountId: ${{ secrets.NEW_RELIC_ACCOUNT_ID }}
+          applicationId: ${{ secrets.NEW_RELIC_APPLICATION_ID_1 }}
+          revision: ${{ github.sha }}
+          description: ${{ github.event.head_commit.message }}
       - name: deploy binary
         env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-        run: |
+          SSH_HOST: ${{ secrets.SSH_HOST_1 }}
+        run: |  # TODO EDIT BEFORE DEPLOY
           ssh -o StrictHostKeyChecking=no "root@$SSH_HOST" "systemctl stop isucari"
-          scp -o StrictHostKeyChecking=no executable/isucari "root@$SSH_HOST:/home/isucon/go/src/github.com/isucon/isucon9-qualify/webapp/go/isucari"
+          scp -o StrictHostKeyChecking=no executable/binary "root@$SSH_HOST:/home/isucon/go/src/github.com/isucon/isucon9-qualify/webapp/go/isucari"
           ssh -o StrictHostKeyChecking=no "root@$SSH_HOST" "chown isucon:isucon /home/isucon/go/src/github.com/isucon/isucon9-qualify/webapp/go/isucari"
           ssh -o StrictHostKeyChecking=no "root@$SSH_HOST" "systemctl start isucari"
-          echo "$GITHUB_REF のデプロイが成功しました。"
+##### 複数台にデプロイする場合はここから上をコピーする #####
+      - name: finish deployment
+        uses: sarisia/actions-status-discord@v1
+        if: always()
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
