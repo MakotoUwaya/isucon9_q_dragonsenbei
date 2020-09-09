@@ -27,7 +27,7 @@ jobs:
         uses: actions/upload-artifact@v1
         with:
           name: executable
-          path: webapp/go/binary
+          path: webapp/go/isucari  # TODO EDIT BEFORE DEPLOY
       - name: notify build failure
         uses: sarisia/actions-status-discord@v1
         if: failure()
@@ -65,7 +65,7 @@ jobs:
           SSH_HOST: ${{ secrets.SSH_HOST_1 }}
         run: |  # TODO EDIT BEFORE DEPLOY
           ssh -o StrictHostKeyChecking=no "root@$SSH_HOST" "systemctl stop isucari"
-          scp -o StrictHostKeyChecking=no executable/binary "root@$SSH_HOST:/home/isucon/go/src/github.com/isucon/isucon9-qualify/webapp/go/isucari"
+          scp -o StrictHostKeyChecking=no executable/isucari "root@$SSH_HOST:/home/isucon/go/src/github.com/isucon/isucon9-qualify/webapp/go/isucari"
           ssh -o StrictHostKeyChecking=no "root@$SSH_HOST" "chown isucon:isucon /home/isucon/go/src/github.com/isucon/isucon9-qualify/webapp/go/isucari"
           ssh -o StrictHostKeyChecking=no "root@$SSH_HOST" "systemctl start isucari"
 ##### 複数台にデプロイする場合はここから上をコピーする #####
