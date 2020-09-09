@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -284,11 +285,23 @@ func nrt(inner http.Handler) http.Handler {
 		w = txn.SetWebResponse(w)
 		defer inner.ServeHTTP(w, r)
 
+		// ログインしていれば ユーザID をヘッダに付加（nginx 向け）
 		session := getSession(r)
 		if userID, ok := session.Values["user_id"]; ok {
 			w.Header().Set("X-Login-User", fmt.Sprintf("%d", userID.(int64)))
 		}
 
+		suffix := fmt.Sprintf("%09d", rand.Intn(999999999))
+		now := time.Now().In(time.FixedZone("Asia/Tokyo", 9 * 60 * 60)).Format(time.RFC3339)
+		requestID := fmt.Sprintf("%s_%s", now, suffix)
+
+		// リクエストごとの ID をヘッダに付加（nginx 向け）
+		w.Header().Set("X-Request-ID", fmt.Sprintf("%s", requestID))
+
+		// リクエストヘッダに入れてみる？ TODO: Context から引っ張り出して SQL なりに付加したい
+		r.Header.Set("X-Dragon-Senbei-Request-ID", fmt.Sprintf("%s", requestID))
+
+		// POST ならリクエストボディを記録
 		if r.Method == "POST" {
 			buf, err := ioutil.ReadAll(r.Body)
 			if err != nil {
@@ -296,12 +309,11 @@ func nrt(inner http.Handler) http.Handler {
 				return
 			}
 			r.Body = ioutil.NopCloser(bytes.NewBuffer(buf))
-			err = ioutil.WriteFile("/tmp/12345.json", buf, 0644)
+			err = ioutil.WriteFile(fmt.Sprintf("/tmp/%s.json", requestID), buf, 0644)
 			if err != nil {
 				fmt.Println(err)
 				return
 			}
-			w.Header().Set("X-Payload-ID", fmt.Sprintf("%d", 12345))
 		}
 	}
 	return http.HandlerFunc(mw)
@@ -318,6 +330,8 @@ func init() {
 }
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	var err error
 	app, err = newrelic.NewApplication(
 		newrelic.ConfigAppName("ISUCON9-q-uwaya"),
@@ -435,7 +449,7 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 	}
 
 	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
-	err := dbx.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
+	err := dbx.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `id` = ?" + fmt.Sprintf("/* %s */ ", r.Header.Get("X-Dragon-Senbei-Request-ID")), userID)
 	if err == sql.ErrNoRows {
 		return user, http.StatusNotFound, "user not found"
 	}
