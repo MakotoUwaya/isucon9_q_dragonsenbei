@@ -1,0 +1,37 @@
+# docker-compose exec -e MYSQL_HOST=127.0.0.1 mysql /init/init.sh
+version: "3"
+services:
+  mysql:
+    restart: always
+    image: "mysql:8.0"
+    container_name: "db"
+    hostname: "db"
+    ports:
+      - "3306:3306"
+    environment:
+      - "MYSQL_RANDOM_ROOT_PASSWORD=true"
+    volumes:
+      - "./webapp/sql/00_create_database.sql:/docker-entrypoint-initdb.d/init.sql:ro"
+      - "./webapp/sql:/init:ro"
+  payment:
+    restart: always
+    image: "debian:buster-slim"
+    container_name: "payment"
+    hostname: "payment"
+    ports:
+      - "5555:5555"
+    volumes:
+      - ".:/app:ro"
+    working_dir: "/app"
+    command: "/app/bin/payment"
+  shipment:
+    restart: always
+    image: "debian:buster-slim"
+    container_name: "shipment"
+    hostname: "shipment"
+    ports:
+      - "7000:7000"
+    volumes:
+      - ".:/app:ro"
+    working_dir: "/app"
+    command: "/app/bin/shipment"
