@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	crand "crypto/rand"
 	"database/sql"
@@ -281,7 +282,27 @@ func nrt(inner http.Handler) http.Handler {
 
 		txn.SetWebRequestHTTP(r)
 		w = txn.SetWebResponse(w)
-		inner.ServeHTTP(w, r)
+		defer inner.ServeHTTP(w, r)
+
+		session := getSession(r)
+		if userID, ok := session.Values["user_id"]; ok {
+			w.Header().Set("X-Login-User", fmt.Sprintf("%d", userID.(int64)))
+		}
+
+		if r.Method == "POST" {
+			buf, err := ioutil.ReadAll(r.Body)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			r.Body = ioutil.NopCloser(bytes.NewBuffer(buf))
+			err = ioutil.WriteFile("/tmp/12345.json", buf, 0644)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			w.Header().Set("X-Payload-ID", fmt.Sprintf("%d", 12345))
+		}
 	}
 	return http.HandlerFunc(mw)
 }
