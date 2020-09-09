@@ -2,6 +2,7 @@
 #
 # * SSH_HOST_1 (and SSH_HOST_2, ...)
 # * SSH_KEY
+# * SSH_CONFIG
 # * NEW_RELIC_API_KEY
 # * NEW_RELIC_ACCOUNT_ID
 # * NEW_RELIC_APPLICATION_ID_1 (and NEW_RELIC_APPLICATION_ID_2, ...)
@@ -39,10 +40,12 @@ jobs:
       - name: install credential
         env:
           SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_CONFIG: ${{ secrets.SSH_CONFIG }}
         run: |
           mkdir -p "$HOME/.ssh"
           echo "$SSH_KEY" > "$HOME/.ssh/id_rsa"
           chmod 400 "$HOME/.ssh/id_rsa"
+          echo "$SSH_CONFIG" > "$HOME/.ssh/config"
       - name: download binary
         uses: actions/download-artifact@v1
         with:
