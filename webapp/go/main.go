@@ -279,7 +279,7 @@ func nrt(inner http.Handler) http.Handler {
 		// ログインしていれば ユーザID をヘッダに付加（nginx 向け）
 		session := getSession(r)
 		if userID, ok := session.Values["user_id"]; ok {
-			w.Header().Set("X-Login-User", fmt.Sprintf("%d", userID.(int64)))
+			w.Header().Set("X-Ds-Login-User", fmt.Sprintf("%d", userID.(int64)))
 		}
 
 		suffix := fmt.Sprintf("%09d", rand.Intn(999999999))
@@ -287,10 +287,10 @@ func nrt(inner http.Handler) http.Handler {
 		requestID := fmt.Sprintf("%s_%s", now, suffix)
 
 		// リクエストごとの ID をヘッダに付加（nginx 向け）
-		w.Header().Set("X-Request-ID", fmt.Sprintf("%s", requestID))
+		w.Header().Set("X-Ds-Request-Id", fmt.Sprintf("%s", requestID))
 
 		// リクエストヘッダに入れてみる？ TODO: Context から引っ張り出して SQL なりに付加したい
-		r.Header.Set("X-Dragon-Senbei-Request-ID", fmt.Sprintf("%s", requestID))
+		r.Header.Set("X-Ds-Request-Id", fmt.Sprintf("%s", requestID))
 
 		// POST ならリクエストボディを記録
 		if r.Method == "POST" {
@@ -449,7 +449,7 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 	}
 
 	ctx := newrelic.NewContext(r.Context(), newrelic.FromContext(r.Context()))
-	err := dbx.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `id` = ?" + fmt.Sprintf("/* %s */ ", r.Header.Get("X-Dragon-Senbei-Request-ID")), userID)
+	err := dbx.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `id` = ?" + fmt.Sprintf("/* %s */ ", r.Header.Get("X-Ds-Request-Id")), userID)
 	if err == sql.ErrNoRows {
 		return user, http.StatusNotFound, "user not found"
 	}
