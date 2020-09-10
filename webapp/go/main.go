@@ -276,15 +276,6 @@ type resSetting struct {
 
 func nrt(inner http.Handler) http.Handler {
 	mw := func(w http.ResponseWriter, r *http.Request) {
-		txn := app.StartTransaction(r.URL.Path)
-		defer txn.End()
-
-		r = newrelic.RequestWithTransactionContext(r, txn)
-
-		txn.SetWebRequestHTTP(r)
-		w = txn.SetWebResponse(w)
-		defer inner.ServeHTTP(w, r)
-
 		// ログインしていれば ユーザID をヘッダに付加（nginx 向け）
 		session := getSession(r)
 		if userID, ok := session.Values["user_id"]; ok {
@@ -315,6 +306,15 @@ func nrt(inner http.Handler) http.Handler {
 				return
 			}
 		}
+
+		txn := app.StartTransaction(r.URL.Path)
+		defer txn.End()
+
+		r = newrelic.RequestWithTransactionContext(r, txn)
+
+		txn.SetWebRequestHTTP(r)
+		w = txn.SetWebResponse(w)
+		inner.ServeHTTP(w, r)
 	}
 	return http.HandlerFunc(mw)
 }
